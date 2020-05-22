@@ -6,7 +6,7 @@
 
 #define PLUGIN "New Plug-In"
 #define VERSION "1.0"
-#define AUTHOR "author"
+#define AUTHOR "CheezPuff"
 
 const TASK = 2707 
 

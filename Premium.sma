@@ -1,3 +1,5 @@
+// Note: All player will be premium right now until you add your own Native of premium
+
 #include <amxmodx>
 
 new const PREFIX[] = "^4[TagServer]^1";

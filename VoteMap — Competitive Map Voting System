@@ -1,5 +1,6 @@
 /*
     VoteMap v1.3
+    - https://pastebin.com/VPSriKc8
     - Maps loaded from configs/maps.ini
     - Auto vote every X minutes (cvar: vm_interval, default 30)
     - RTV system with player threshold

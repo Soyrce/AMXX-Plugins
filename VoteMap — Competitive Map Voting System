@@ -1,0 +1,506 @@
+/*
+    VoteMap v1.3
+    - Maps loaded from configs/maps.ini
+    - Auto vote every X minutes (cvar: vm_interval, default 30)
+    - RTV system with player threshold
+    - Vote menu with real-time vote counts + HUD timer
+    - Map changes cleanly after round end
+
+    Fixes v1.1:
+    - RTV now correctly checks player ratio before starting
+    - Vote menu timer no longer freezes at 5 seconds
+    - HUD repositioned so it doesn't overlap the vote menu
+    - RTV cooldown set to 5 minutes (300s) after map change
+
+    Fixes v1.2:
+    - RTV cooldown now survives map changes (saved to votemap_cooldown.ini)
+    - Minimum 5 players required on server before RTV is allowed
+    - HUD position adjusted slightly inward (less extreme corner)
+
+    Fixes v1.3:
+    - SaveCooldownExpiry/LoadCooldownExpiry type mismatch fixed (was writing
+      float %f but reading back with str_to_num -- now consistent integers)
+    - g_lastMap now persisted to votemap_lastmap.ini so "Last Map was:" shows
+      the correct previous map after changelevel (was showing current map)
+    - Removed unused g_voteMenuId global variable
+*/
+
+#include <amxmodx>
+#include <amxmisc>
+
+#define PLUGIN   "VoteMap"
+#define VERSION  "1.3"
+#define AUTHOR   "CheezPuff"
+
+#define MAPS_TO_SHOW      4
+#define MAX_MAPS          128
+#define RTV_MIN_PLAYERS   5      // server must have at least this many players for RTV
+
+#define TASK_VOTE_COUNTDOWN  10001
+#define TASK_AUTO_VOTE       10002
+#define TASK_CHANGEMAP       10003
+#define TASK_HUD             10004
+
+new g_mapList[MAX_MAPS][32]
+new g_mapCount
+
+new g_voteActive
+new g_voteTime
+new g_voteMaps[MAPS_TO_SHOW][32]
+new g_mapVotes[MAPS_TO_SHOW]
+new g_votedPlayers[33]
+
+new g_rtvVotes[33]
+new g_rtvCount
+
+new g_nextMap[32]
+new g_lastMap[32]
+new bool:g_nextMapChosen
+new bool:g_mapChangeScheduled
+new bool:g_rtvCooldown
+
+new g_CvarInterval
+new g_CvarVoteTime
+new g_CvarRtvRatio
+new g_CvarRtvCooldown
+
+new g_cooldownFile[128]
+
+stock SaveCooldownExpiry(expiresAt) {
+    new file = fopen(g_cooldownFile, "wt")
+    if(!file) return
+    fprintf(file, "%d^n", expiresAt)
+    fclose(file)
+}
+
+stock LoadCooldownExpiry() {
+    new file = fopen(g_cooldownFile, "rt")
+    if(!file) return 0
+    new line[32]
+    fgets(file, line, charsmax(line))
+    fclose(file)
+    trim(line)
+    if(!line[0]) return 0
+    return str_to_num(line)
+}
+
+stock DeleteCooldownFile() {
+    if(file_exists(g_cooldownFile))
+        delete_file(g_cooldownFile)
+}
+
+stock LoadMapList() {
+    new mapFile[128]
+    get_configsdir(mapFile, charsmax(mapFile))
+    add(mapFile, charsmax(mapFile), "/maps.ini")
+
+    new file = fopen(mapFile, "rt")
+    if(!file) {
+        log_amx("[VoteMap] ERROR: Cannot open %s", mapFile)
+        return
+    }
+
+    g_mapCount = 0
+    new line[32]
+    while(!feof(file) && g_mapCount < MAX_MAPS) {
+        fgets(file, line, charsmax(line))
+        trim(line)
+        if(line[0] && line[0] != ';') {
+            copy(g_mapList[g_mapCount], charsmax(g_mapList[]), line)
+            g_mapCount++
+        }
+    }
+    fclose(file)
+    log_amx("[VoteMap] Loaded %d maps from maps.ini", g_mapCount)
+}
+
+stock SelectRandomMaps() {
+    new used[MAX_MAPS]
+    arrayset(used, 0, sizeof(used))
+    for(new i = 0; i < MAPS_TO_SHOW; i++) {
+        new idx, attempts = 0
+        do {
+            idx = random(g_mapCount)
+            attempts++
+            if(attempts > 1000) break
+        } while(used[idx])
+        used[idx] = 1
+        copy(g_voteMaps[i], charsmax(g_voteMaps[]), g_mapList[idx])
+    }
+}
+
+stock ShowVoteMenu() {
+    new menu[512], len
+    len = formatex(menu, charsmax(menu), "\yVote for next map: \w(%d sec left)^n", g_voteTime)
+    for(new i = 0; i < MAPS_TO_SHOW; i++)
+        len += formatex(menu[len], charsmax(menu) - len, "^n\r%d. \w%s \d[%d votes]", i+1, g_voteMaps[i], g_mapVotes[i])
+    if(g_lastMap[0])
+        len += formatex(menu[len], charsmax(menu) - len, "^n^n\d-- Last Map was: \y%s\d...", g_lastMap)
+    new players[32], pNum
+    get_players(players, pNum, "c")
+    for(new i = 0; i < pNum; i++)
+        if(!g_votedPlayers[players[i]])
+            show_menu(players[i], MENU_KEY_1|MENU_KEY_2|MENU_KEY_3|MENU_KEY_4, menu, -1, "VoteMap")
+}
+
+stock ShowLockedMenu(id) {
+    new menu[512], len
+    len = formatex(menu, charsmax(menu), "\yVote for next map: \w(%d sec left)^n", g_voteTime)
+    for(new i = 0; i < MAPS_TO_SHOW; i++)
+        len += formatex(menu[len], charsmax(menu) - len, "^n\d%d. %s [%d votes]", i+1, g_voteMaps[i], g_mapVotes[i])
+    len += formatex(menu[len], charsmax(menu) - len, "^n^n\dYou have already voted.")
+    if(g_lastMap[0])
+        len += formatex(menu[len], charsmax(menu) - len, "^n\d-- Last Map was: \y%s\d...", g_lastMap)
+    show_menu(id, 0, menu, -1, "VoteMap")
+}
+
+stock ShowVoteHud() {
+    new hud[256], len
+    len = formatex(hud, charsmax(hud), "-- Vote for next map (%ds) --^n", g_voteTime)
+    for(new i = 0; i < MAPS_TO_SHOW; i++)
+        len += formatex(hud[len], charsmax(hud) - len, "%d. %s [%d]^n", i+1, g_voteMaps[i], g_mapVotes[i])
+    set_hudmessage(255, 200, 0, 0.55, 0.05, 0, 0.1, 1.1, 0.0, 0.0, -1)
+    show_hudmessage(0, "%s", hud)
+}
+
+stock EndVote() {
+    g_voteActive = 0
+    remove_task(TASK_HUD)
+    remove_task(TASK_VOTE_COUNTDOWN)
+    show_menu(0, 0, "", 1)
+
+    new winner = 0
+    for(new i = 1; i < MAPS_TO_SHOW; i++)
+        if(g_mapVotes[i] > g_mapVotes[winner]) winner = i
+
+    copy(g_nextMap, charsmax(g_nextMap), g_voteMaps[winner])
+    g_nextMapChosen      = true
+    g_mapChangeScheduled = true
+
+    new totalVotes = 0
+    for(new i = 0; i < MAPS_TO_SHOW; i++) totalVotes += g_mapVotes[i]
+
+    set_hudmessage(100, 255, 100, 0.02, 0.25, 0, 0.5, 6.0, 0.1, 0.3, -1)
+    show_hudmessage(0, "Vote ended!^nNext map: %s^n(%d/%d votes)", g_nextMap, g_mapVotes[winner], totalVotes)
+
+    client_print(0, print_chat, "[VoteMap] Next map: %s (%d/%d votes) -- changes after this round.", g_nextMap, g_mapVotes[winner], totalVotes)
+}
+
+stock StartVote() {
+    if(g_mapCount < MAPS_TO_SHOW) {
+        log_amx("[VoteMap] Not enough maps in maps.ini (need at least %d)", MAPS_TO_SHOW)
+        return
+    }
+
+    g_voteActive = 1
+    g_voteTime   = get_pcvar_num(g_CvarVoteTime)
+    if(g_voteTime < 10) g_voteTime = 10
+    if(g_voteTime > 60) g_voteTime = 60
+
+    arrayset(g_mapVotes,     0, sizeof(g_mapVotes))
+    arrayset(g_votedPlayers, 0, sizeof(g_votedPlayers))
+    arrayset(g_rtvVotes,     0, sizeof(g_rtvVotes))
+    g_rtvCount = 0
+
+    SelectRandomMaps()
+
+    set_hudmessage(255, 150, 0, 0.02, 0.25, 0, 0.5, 3.0, 0.1, 0.3, -1)
+    show_hudmessage(0, "Map vote starting!^nGet ready to vote...")
+    client_print(0, print_chat, "[VoteMap] Map vote is starting! Use the menu to vote.")
+    set_task(3.0, "ShowVoteTask", TASK_VOTE_COUNTDOWN)
+}
+
+public plugin_init() {
+    register_plugin(PLUGIN, VERSION, AUTHOR)
+
+    g_CvarInterval    = register_cvar("vm_interval",     "30")
+    g_CvarVoteTime    = register_cvar("vm_vote_time",    "30")
+    g_CvarRtvRatio    = register_cvar("vm_rtv_ratio",    "60")
+    g_CvarRtvCooldown = register_cvar("vm_rtv_cooldown", "300")
+
+    register_clcmd("say",      "CmdSay")
+    register_clcmd("say_team", "CmdSay")
+
+    register_concmd("amx_startvote",  "CmdAdminStartVote",  ADMIN_MAP, "- Force start a map vote")
+    register_concmd("amx_cancelvote", "CmdAdminCancelVote", ADMIN_MAP, "- Cancel current vote")
+    register_concmd("amx_setnextmap", "CmdAdminSetNextMap", ADMIN_MAP, "<map> - Set next map manually")
+    register_concmd("amx_reloadmaps", "CmdAdminReloadMaps", ADMIN_MAP, "- Reload maps.ini")
+
+    register_menuid("VoteMap")
+    register_menucmd(register_menuid("VoteMap"), MENU_KEY_1|MENU_KEY_2|MENU_KEY_3|MENU_KEY_4, "HandleVote")
+
+    register_logevent("EventRoundEnd", 2, "1=Round_End")
+
+    LoadMapList()
+
+    g_nextMapChosen      = false
+    g_mapChangeScheduled = false
+    g_rtvCooldown        = false
+    g_nextMap[0]         = EOS
+    g_lastMap[0]         = EOS
+
+    // Build cooldown file path: <configs>/votemap_cooldown.ini
+    get_configsdir(g_cooldownFile, charsmax(g_cooldownFile))
+    add(g_cooldownFile, charsmax(g_cooldownFile), "/votemap_cooldown.ini")
+
+    // Check if a cooldown was active before the map change
+    new sysNow    = get_systime()
+    new sysExpiry = LoadCooldownExpiry()
+    if(sysExpiry > sysNow) {
+        g_rtvCooldown = true
+        new Float:remaining = float(sysExpiry - sysNow)
+        set_task(remaining, "RtvCooldownEnd")
+        log_amx("[VoteMap] RTV cooldown restored: %d seconds remaining", sysExpiry - sysNow)
+    } else {
+        DeleteCooldownFile()
+    }
+
+    // Save current map as lastMap — also write to file so next session can show it
+    get_mapname(g_lastMap, charsmax(g_lastMap))
+    new lastMapFile[128]
+    get_configsdir(lastMapFile, charsmax(lastMapFile))
+    add(lastMapFile, charsmax(lastMapFile), "/votemap_lastmap.ini")
+    // Try to read previously saved lastMap first (set by DoChangeMap before changelevel)
+    new lf = fopen(lastMapFile, "rt")
+    if(lf) {
+        new lline[32]
+        fgets(lf, lline, charsmax(lline))
+        fclose(lf)
+        trim(lline)
+        if(lline[0])
+            copy(g_lastMap, charsmax(g_lastMap), lline)
+    }
+
+    new Float:interval = float(get_pcvar_num(g_CvarInterval)) * 60.0
+    if(interval < 60.0) interval = 60.0
+    set_task(interval, "AutoVoteTask", TASK_AUTO_VOTE)
+}
+
+public client_putinserver(id) {
+    g_votedPlayers[id] = 0
+    g_rtvVotes[id]     = 0
+}
+
+public client_disconnected(id) {
+    if(g_rtvVotes[id]) {
+        g_rtvVotes[id] = 0
+        g_rtvCount--
+        if(g_rtvCount < 0) g_rtvCount = 0
+    }
+    g_votedPlayers[id] = 0
+}
+
+public ShowVoteTask() {
+    remove_task(TASK_VOTE_COUNTDOWN)
+    ShowVoteMenu()
+    ShowVoteHud()
+    set_task(1.0, "VoteCountdown", TASK_VOTE_COUNTDOWN, _, _, "b")
+    set_task(1.0, "VoteHudUpdate", TASK_HUD, _, _, "b")
+}
+
+public VoteCountdown() {
+    if(!g_voteActive) {
+        remove_task(TASK_VOTE_COUNTDOWN)
+        return
+    }
+
+    g_voteTime--
+
+    if(g_voteTime <= 0) {
+        remove_task(TASK_VOTE_COUNTDOWN)
+        EndVote()
+        return
+    }
+
+    ShowVoteMenu()
+
+    new players[32], pNum
+    get_players(players, pNum, "c")
+    for(new i = 0; i < pNum; i++)
+        if(g_votedPlayers[players[i]])
+            ShowLockedMenu(players[i])
+}
+
+public VoteHudUpdate() {
+    if(!g_voteActive) {
+        remove_task(TASK_HUD)
+        return
+    }
+    ShowVoteHud()
+}
+
+public HandleVote(id, key) {
+    if(!g_voteActive) return PLUGIN_HANDLED
+    if(g_votedPlayers[id]) return PLUGIN_HANDLED
+
+    g_votedPlayers[id] = 1
+    g_mapVotes[key]++
+
+    ShowLockedMenu(id)
+
+    set_hudmessage(100, 255, 100, 0.02, 0.55, 0, 0.5, 3.0, 0.1, 0.3, -1)
+    show_hudmessage(id, "Voted for: %s", g_voteMaps[key])
+
+    new name[32]
+    get_user_name(id, name, charsmax(name))
+    client_print(0, print_chat, "[VoteMap] %s voted for %s", name, g_voteMaps[key])
+
+    return PLUGIN_HANDLED
+}
+
+public AutoVoteTask() {
+    if(g_voteActive || g_nextMapChosen) return
+    client_print(0, print_chat, "[VoteMap] Auto map vote starting...")
+    StartVote()
+}
+
+public RtvCooldownEnd() {
+    g_rtvCooldown = false
+    DeleteCooldownFile()
+    client_print(0, print_chat, "[VoteMap] RTV is now available again.")
+}
+
+public EventRoundEnd() {
+    if(!g_mapChangeScheduled) return
+    g_mapChangeScheduled = false
+
+    g_rtvCooldown = true
+    new Float:cooldown = float(get_pcvar_num(g_CvarRtvCooldown))
+    if(cooldown < 10.0) cooldown = 10.0
+    new expiryTime = get_systime() + floatround(cooldown, floatround_floor)
+    SaveCooldownExpiry(expiryTime)
+    set_task(cooldown, "RtvCooldownEnd")
+
+    set_hudmessage(255, 100, 100, -1.0, 0.45, 1, 0.5, 4.0, 0.1, 0.3, -1)
+    show_hudmessage(0, "Changing map to %s!", g_nextMap)
+    client_print(0, print_chat, "[VoteMap] Round over -- changing map to %s!", g_nextMap)
+    set_task(4.0, "DoChangeMap", TASK_CHANGEMAP)
+}
+
+public DoChangeMap() {
+    new currentMap[32]
+    get_mapname(currentMap, charsmax(currentMap))
+    new lastMapFile[128]
+    get_configsdir(lastMapFile, charsmax(lastMapFile))
+    add(lastMapFile, charsmax(lastMapFile), "/votemap_lastmap.ini")
+    new lf = fopen(lastMapFile, "wt")
+    if(lf) {
+        fprintf(lf, "%s^n", currentMap)
+        fclose(lf)
+    }
+    server_cmd("changelevel %s", g_nextMap)
+}
+
+public CmdSay(id) {
+    new said[32]
+    read_args(said, charsmax(said))
+    remove_quotes(said)
+    trim(said)
+
+    if(equali(said, "rtv") || equali(said, "rockthevote")) {
+        HandleRTV(id)
+        return PLUGIN_CONTINUE
+    }
+    if(equali(said, "nextmap") || equali(said, "/nextmap")) {
+        if(g_nextMapChosen)
+            client_print(id, print_chat, "[VoteMap] Next map: %s", g_nextMap)
+        else
+            client_print(id, print_chat, "[VoteMap] No nextmap yet.")
+        return PLUGIN_CONTINUE
+    }
+    return PLUGIN_CONTINUE
+}
+
+HandleRTV(id) {
+    if(g_rtvCooldown) {
+        client_print(id, print_chat, "[VoteMap] RTV is on cooldown after map change. Please wait.")
+        return
+    }
+    if(g_voteActive) {
+        client_print(id, print_chat, "[VoteMap] Vote already in progress -- use the menu!")
+        return
+    }
+    if(g_nextMapChosen) {
+        client_print(id, print_chat, "[VoteMap] Next map already chosen: %s", g_nextMap)
+        return
+    }
+    if(g_rtvVotes[id]) {
+        client_print(id, print_chat, "[VoteMap] You already voted to rock the vote!")
+        return
+    }
+
+    new players[32], pNum
+    get_players(players, pNum, "ch")
+    if(pNum < 1) pNum = 1
+
+    if(pNum < RTV_MIN_PLAYERS) {
+        client_print(id, print_chat, "[VoteMap] RTV requires at least %d players on the server. (%d/%d)", RTV_MIN_PLAYERS, pNum, RTV_MIN_PLAYERS)
+        return
+    }
+
+    g_rtvVotes[id] = 1
+    g_rtvCount++
+
+    new needed = ( (get_pcvar_num(g_CvarRtvRatio) * pNum) + 99 ) / 100
+    if(needed < 1) needed = 1
+
+    new name[32]
+    get_user_name(id, name, charsmax(name))
+    client_print(0, print_chat, "[VoteMap] %s wants to rock the vote! (%d/%d needed)", name, g_rtvCount, needed)
+
+    if(g_rtvCount >= needed) {
+        client_print(0, print_chat, "[VoteMap] RTV passed! Starting vote...")
+        StartVote()
+    }
+}
+
+public CmdAdminStartVote(id, level, cid) {
+    if(!cmd_access(id, level, cid, 1)) return PLUGIN_HANDLED
+    if(g_voteActive) {
+        console_print(id, "[VoteMap] Vote already in progress.")
+        return PLUGIN_HANDLED
+    }
+    StartVote()
+    console_print(id, "[VoteMap] Vote started.")
+    return PLUGIN_HANDLED
+}
+
+public CmdAdminCancelVote(id, level, cid) {
+    if(!cmd_access(id, level, cid, 1)) return PLUGIN_HANDLED
+    if(!g_voteActive) {
+        console_print(id, "[VoteMap] No vote in progress.")
+        return PLUGIN_HANDLED
+    }
+    remove_task(TASK_VOTE_COUNTDOWN)
+    remove_task(TASK_HUD)
+    show_menu(0, 0, "", 1)
+    g_voteActive = 0
+    arrayset(g_mapVotes,     0, sizeof(g_mapVotes))
+    arrayset(g_votedPlayers, 0, sizeof(g_votedPlayers))
+    client_print(0, print_chat, "[VoteMap] Vote cancelled by admin.")
+    console_print(id, "[VoteMap] Vote cancelled.")
+    return PLUGIN_HANDLED
+}
+
+public CmdAdminSetNextMap(id, level, cid) {
+    if(!cmd_access(id, level, cid, 2)) return PLUGIN_HANDLED
+    new map[32]
+    read_argv(1, map, charsmax(map))
+    if(!map[0]) {
+        console_print(id, "[VoteMap] Usage: amx_setnextmap <mapname>")
+        return PLUGIN_HANDLED
+    }
+    copy(g_nextMap, charsmax(g_nextMap), map)
+    g_nextMapChosen      = true
+    g_mapChangeScheduled = true
+    client_print(0, print_chat, "[VoteMap] Admin set next map: %s", g_nextMap)
+    console_print(id, "[VoteMap] Next map set to: %s", g_nextMap)
+    return PLUGIN_HANDLED
+}
+
+public CmdAdminReloadMaps(id, level, cid) {
+    if(!cmd_access(id, level, cid, 1)) return PLUGIN_HANDLED
+    LoadMapList()
+    console_print(id, "[VoteMap] Reloaded maps.ini -- %d maps loaded.", g_mapCount)
+    return PLUGIN_HANDLED
+}
